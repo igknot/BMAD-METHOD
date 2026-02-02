@@ -2,16 +2,79 @@ const path = require('node:path');
 const { BaseIdeSetup } = require('./_base-ide');
 const chalk = require('chalk');
 const fs = require('fs-extra');
-const yaml = require('yaml');
+const { AgentCommandGenerator } = require('./shared/agent-command-generator');
+const { WorkflowCommandGenerator } = require('./shared/workflow-command-generator');
+const { TaskToolCommandGenerator } = require('./shared/task-tool-command-generator');
 
 /**
  * Kiro CLI setup handler for BMad Method
+ *
+ * ARCHITECTURE NOTE: Kiro uses shared generators to collect agent artifacts from the
+ * installed bmadDir (compiled .md files with <agent> XML tags). The generators provide
+ * artifact metadata which Kiro then transforms to Kiro-specific JSON format with
+ * separate prompt files.
+ *
+ * Flow: bmadDir (compiled agents) -> AgentCommandGenerator -> Kiro JSON transformation
  */
 class KiroCliSetup extends BaseIdeSetup {
-  constructor() {
+  constructor(options = {}) {
     super('kiro-cli', 'Kiro CLI', false);
     this.configDir = '.kiro';
     this.agentsDir = 'agents';
+
+    // Synchronize bmadFolderName with base class if provided
+    if (options.bmadFolderName) {
+      this.bmadFolderName = options.bmadFolderName;
+    }
+
+    // Compose with shared generators for artifact collection from installed bmadDir
+    // Generators read from compiled agents in _bmad/ directory (not source YAML)
+    this.agentGenerator = new AgentCommandGenerator(this.bmadFolderName);
+    this.workflowGenerator = new WorkflowCommandGenerator(this.bmadFolderName);
+    this.taskToolGenerator = new TaskToolCommandGenerator();
+  }
+
+  /**
+   * Detect existing BMAD and Kiro installations
+   * Determines installation state: no-bmad, new, or upgrade
+   *
+   * @param {string} projectDir - Project directory to check
+   * @returns {Promise<{state: string, canProceed: boolean}>} Detection result
+   */
+  async detectInstallation(projectDir) {
+    console.log(chalk.cyan('Detecting BMAD installation...'));
+
+    const bmadPath = path.join(projectDir, this.bmadFolderName);
+    const kiroPath = path.join(projectDir, this.configDir);
+    const agentsPath = path.join(kiroPath, this.agentsDir);
+    const commandsPath = path.join(kiroPath, 'commands');
+
+    const bmadExists = await fs.pathExists(bmadPath);
+    const kiroExists = await fs.pathExists(kiroPath);
+    const agentsExists = await fs.pathExists(agentsPath);
+    const commandsExists = await fs.pathExists(commandsPath);
+
+    if (!bmadExists) {
+      console.log(chalk.yellow(`⚠ No ${this.bmadFolderName}/ folder found. BMAD may not be installed.`));
+      return { state: 'no-bmad', canProceed: false };
+    }
+
+    console.log(chalk.green(`✓ Found ${this.bmadFolderName}/ folder`));
+
+    if (kiroExists) {
+      console.log(chalk.green(`✓ Found existing ${this.configDir}/ installation`));
+      if (agentsExists) {
+        console.log(chalk.dim(`  └─ ${this.configDir}/${this.agentsDir}/ exists`));
+      }
+      if (commandsExists) {
+        console.log(chalk.dim(`  └─ ${this.configDir}/commands/ exists`));
+      }
+      console.log(chalk.cyan('→ Upgrade mode: Will clean and reinstall'));
+      return { state: 'upgrade', canProceed: true };
+    }
+
+    console.log(chalk.cyan('→ New Kiro installation'));
+    return { state: 'new', canProceed: true };
   }
 
   /**
@@ -35,12 +98,23 @@ class KiroCliSetup extends BaseIdeSetup {
 
   /**
    * Setup Kiro CLI configuration with BMad agents
+   * Uses shared AgentCommandGenerator to collect artifacts from installed bmadDir,
+   * then transforms them to Kiro-specific JSON format.
+   *
    * @param {string} projectDir - Project directory
-   * @param {string} bmadDir - BMAD installation directory
+   * @param {string} bmadDir - BMAD installation directory (compiled agents)
    * @param {Object} options - Setup options
    */
   async setup(projectDir, bmadDir, options = {}) {
     console.log(chalk.cyan(`Setting up ${this.name}...`));
+
+    // Detect existing installation state
+    const detection = await this.detectInstallation(projectDir);
+    if (!detection.canProceed) {
+      console.log(chalk.red(`Cannot proceed: ${this.bmadFolderName}/ folder is required.`));
+      console.log(chalk.yellow('Please install BMAD first before running Kiro setup.'));
+      return;
+    }
 
     await this.cleanup(projectDir);
 
@@ -49,147 +123,118 @@ class KiroCliSetup extends BaseIdeSetup {
 
     await this.ensureDir(agentsDir);
 
-    // Create BMad agents from source YAML files
-    await this.createBmadAgentsFromSource(agentsDir, projectDir);
+    // Use shared generator to collect agent artifacts from installed bmadDir
+    const selectedModules = options.selectedModules || [];
+    const { artifacts: agentArtifacts } = await this.agentGenerator.collectAgentArtifacts(bmadDir, selectedModules);
 
-    console.log(chalk.green(`✓ ${this.name} configured with BMad agents`));
-  }
-
-  /**
-   * Create BMad agent definitions from source YAML files
-   * @param {string} agentsDir - Agents directory
-   * @param {string} projectDir - Project directory
-   */
-  async createBmadAgentsFromSource(agentsDir, projectDir) {
-    const sourceDir = path.join(__dirname, '../../../../../src/modules');
-
-    // Find all agent YAML files
-    const agentFiles = await this.findAgentFiles(sourceDir);
-
-    for (const agentFile of agentFiles) {
+    let agentCount = 0;
+    for (const artifact of agentArtifacts) {
       try {
-        await this.processAgentFile(agentFile, agentsDir, projectDir);
+        await this.processAgentArtifact(artifact, agentsDir, projectDir);
+        agentCount++;
       } catch (error) {
-        console.warn(chalk.yellow(`⚠️  Failed to process ${agentFile}: ${error.message}`));
+        console.warn(chalk.yellow(`  Warning: Failed to process agent ${artifact.name}: ${error.message}`));
       }
     }
+
+    console.log(chalk.green(`✓ ${this.name} configured with ${agentCount} BMad agents`));
   }
 
   /**
-   * Find all agent YAML files in modules and core
-   * @param {string} sourceDir - Source modules directory
-   * @returns {Array} Array of agent file paths
-   */
-  async findAgentFiles(sourceDir) {
-    const agentFiles = [];
-
-    // Check core agents
-    const coreAgentsDir = path.join(__dirname, '../../../../../src/core/agents');
-    if (await fs.pathExists(coreAgentsDir)) {
-      const files = await fs.readdir(coreAgentsDir);
-
-      for (const file of files) {
-        if (file.endsWith('.agent.yaml')) {
-          agentFiles.push(path.join(coreAgentsDir, file));
-        }
-      }
-    }
-
-    // Check module agents
-    if (!(await fs.pathExists(sourceDir))) {
-      return agentFiles;
-    }
-
-    const modules = await fs.readdir(sourceDir);
-
-    for (const module of modules) {
-      const moduleAgentsDir = path.join(sourceDir, module, 'agents');
-
-      if (await fs.pathExists(moduleAgentsDir)) {
-        const files = await fs.readdir(moduleAgentsDir);
-
-        for (const file of files) {
-          if (file.endsWith('.agent.yaml')) {
-            agentFiles.push(path.join(moduleAgentsDir, file));
-          }
-        }
-      }
-    }
-
-    return agentFiles;
-  }
-
-  /**
-   * Validate BMad Core compliance
-   * @param {Object} agentData - Agent YAML data
-   * @returns {boolean} True if compliant
-   */
-  validateBmadCompliance(agentData) {
-    const requiredFields = ['agent.metadata.id', 'agent.persona.role', 'agent.persona.principles'];
-
-    for (const field of requiredFields) {
-      const keys = field.split('.');
-      let current = agentData;
-
-      for (const key of keys) {
-        if (!current || !current[key]) {
-          return false;
-        }
-        current = current[key];
-      }
-    }
-
-    return true;
-  }
-
-  /**
-   * Process individual agent YAML file
-   * @param {string} agentFile - Path to agent YAML file
+   * Process an agent artifact from the shared generator and create Kiro files
+   * Reads the compiled agent .md file to extract persona information from XML tags
+   *
+   * @param {Object} artifact - Agent artifact from AgentCommandGenerator
    * @param {string} agentsDir - Target agents directory
    * @param {string} projectDir - Project directory
    */
-  async processAgentFile(agentFile, agentsDir, projectDir) {
-    const yamlContent = await fs.readFile(agentFile, 'utf8');
-    const agentData = yaml.parse(yamlContent);
+  async processAgentArtifact(artifact, agentsDir, projectDir) {
+    // Read the actual compiled agent file to extract persona info
+    const agentContent = await fs.readFile(artifact.sourcePath, 'utf8');
 
-    if (!this.validateBmadCompliance(agentData)) {
+    // Parse agent metadata from the compiled markdown/XML content
+    const agentData = this.parseCompiledAgent(agentContent, artifact);
+
+    if (!agentData) {
       return;
     }
 
-    // Extract module from file path
-    const normalizedPath = path.normalize(agentFile);
-    const pathParts = normalizedPath.split(path.sep);
-    const basename = path.basename(agentFile, '.agent.yaml');
+    // Create Kiro agent name: bmad-{module}-{name}
+    const agentName = `bmad-${artifact.module}-${artifact.name}`;
+    const sanitizedAgentName = this.sanitizeAgentName(agentName);
 
-    // Find the module name from path
-    let moduleName = 'unknown';
-    if (pathParts.includes('src')) {
-      const srcIndex = pathParts.indexOf('src');
-      if (srcIndex + 3 < pathParts.length) {
-        const folderAfterSrc = pathParts[srcIndex + 1];
-        if (folderAfterSrc === 'core') {
-          moduleName = 'core';
-        } else if (folderAfterSrc === 'bmm') {
-          moduleName = 'bmm';
-        }
+    // Create Kiro JSON definition
+    await this.createAgentDefinition(agentsDir, sanitizedAgentName, agentData);
+
+    // Create Kiro prompt file
+    await this.createAgentPrompt(agentsDir, sanitizedAgentName, agentData, projectDir);
+  }
+
+  /**
+   * Parse compiled agent markdown to extract persona information
+   * Compiled agents have XML <agent> tags with persona, menu, etc.
+   *
+   * @param {string} content - Compiled agent markdown content
+   * @param {Object} artifact - Agent artifact metadata
+   * @returns {Object|null} Parsed agent data or null if invalid
+   */
+  parseCompiledAgent(content, artifact) {
+    // Extract agent XML tag attributes
+    const agentTagMatch = content.match(/<agent\s+([^>]+)>/);
+    if (!agentTagMatch) {
+      return null;
+    }
+
+    // Parse attributes from the agent tag
+    const attrs = agentTagMatch[1];
+    const nameMatch = attrs.match(/name="([^"]+)"/);
+    const titleMatch = attrs.match(/title="([^"]+)"/);
+    const iconMatch = attrs.match(/icon="([^"]+)"/);
+
+    // Extract persona section
+    const personaMatch = content.match(/<persona>([\s\S]*?)<\/persona>/);
+    let role = '';
+    let identity = '';
+    let communicationStyle = '';
+    let principles = '';
+
+    if (personaMatch) {
+      const personaContent = personaMatch[1];
+      const roleMatch = personaContent.match(/<role>([^<]+)<\/role>/);
+      const identityMatch = personaContent.match(/<identity>([^<]+)<\/identity>/);
+      const styleMatch = personaContent.match(/<communication_style>([^<]+)<\/communication_style>/);
+      const principlesMatch = personaContent.match(/<principles>([^<]+)<\/principles>/);
+
+      role = roleMatch ? roleMatch[1].trim() : '';
+      identity = identityMatch ? identityMatch[1].trim() : '';
+      communicationStyle = styleMatch ? styleMatch[1].trim() : '';
+      principles = principlesMatch ? principlesMatch[1].trim() : '';
+    }
+
+    // Extract menu items
+    const menuItems = [];
+    const menuMatch = content.match(/<menu>([\s\S]*?)<\/menu>/);
+    if (menuMatch) {
+      const itemRegex = /<item\s+cmd="([^"]+)"[^>]*>([^<]+)<\/item>/g;
+      let itemMatch;
+      while ((itemMatch = itemRegex.exec(menuMatch[1])) !== null) {
+        menuItems.push({
+          trigger: itemMatch[1],
+          description: itemMatch[2].trim(),
+        });
       }
     }
 
-    // Extract the agent name from the ID path in YAML if available
-    let agentBaseName = basename;
-    if (agentData.agent && agentData.agent.metadata && agentData.agent.metadata.id) {
-      const idPath = agentData.agent.metadata.id;
-      agentBaseName = path.basename(idPath, '.md');
-    }
-
-    const agentName = `bmad-${moduleName}-${agentBaseName}`;
-    const sanitizedAgentName = this.sanitizeAgentName(agentName);
-
-    // Create JSON definition
-    await this.createAgentDefinitionFromYaml(agentsDir, sanitizedAgentName, agentData);
-
-    // Create prompt file
-    await this.createAgentPromptFromYaml(agentsDir, sanitizedAgentName, agentData, projectDir);
+    return {
+      name: nameMatch ? nameMatch[1] : artifact.name,
+      title: titleMatch ? titleMatch[1] : artifact.description,
+      icon: iconMatch ? iconMatch[1] : '🤖',
+      role,
+      identity,
+      communicationStyle,
+      principles,
+      menuItems,
+    };
   }
 
   /**
@@ -205,18 +250,15 @@ class KiroCliSetup extends BaseIdeSetup {
   }
 
   /**
-   * Create agent JSON definition from YAML data
+   * Create Kiro agent JSON definition from parsed agent data
    * @param {string} agentsDir - Agents directory
-   * @param {string} agentName - Agent name (role-based)
-   * @param {Object} agentData - Agent YAML data
+   * @param {string} agentName - Sanitized agent name (e.g., bmad-bmm-pm)
+   * @param {Object} agentData - Parsed agent data from compiled markdown
    */
-  async createAgentDefinitionFromYaml(agentsDir, agentName, agentData) {
-    const personName = agentData.agent.metadata.name;
-    const role = agentData.agent.persona.role;
-
+  async createAgentDefinition(agentsDir, agentName, agentData) {
     const agentConfig = {
       name: agentName,
-      description: `${personName} - ${role}`,
+      description: `${agentData.name} - ${agentData.role || agentData.title}`,
       prompt: `file://./${agentName}-prompt.md`,
       tools: ['*'],
       mcpServers: {},
@@ -229,52 +271,45 @@ class KiroCliSetup extends BaseIdeSetup {
   }
 
   /**
-   * Create agent prompt from YAML data
+   * Create Kiro agent prompt file from parsed agent data
    * @param {string} agentsDir - Agents directory
-   * @param {string} agentName - Agent name (role-based)
-   * @param {Object} agentData - Agent YAML data
+   * @param {string} agentName - Sanitized agent name
+   * @param {Object} agentData - Parsed agent data from compiled markdown
    * @param {string} projectDir - Project directory
    */
-  async createAgentPromptFromYaml(agentsDir, agentName, agentData, projectDir) {
+  async createAgentPrompt(agentsDir, agentName, agentData, projectDir) {
     const promptPath = path.join(agentsDir, `${agentName}-prompt.md`);
-
-    // Generate prompt from YAML data
-    const prompt = this.generatePromptFromYaml(agentData);
+    const prompt = this.generatePrompt(agentData);
     await fs.writeFile(promptPath, prompt);
   }
 
   /**
-   * Generate prompt content from YAML data
-   * @param {Object} agentData - Agent YAML data
-   * @returns {string} Generated prompt
+   * Generate Kiro prompt content from parsed agent data
+   * @param {Object} agentData - Parsed agent data
+   * @returns {string} Generated prompt markdown
    */
-  generatePromptFromYaml(agentData) {
-    const agent = agentData.agent;
-    const name = agent.metadata.name;
-    const icon = agent.metadata.icon || '🤖';
-    const role = agent.persona.role;
-    const identity = agent.persona.identity;
-    const style = agent.persona.communication_style;
-    const principles = agent.persona.principles;
+  generatePrompt(agentData) {
+    const { name, icon, role, identity, communicationStyle, principles, menuItems } = agentData;
 
     let prompt = `# ${name} ${icon}\n\n`;
-    prompt += `## Role\n${role}\n\n`;
+
+    if (role) {
+      prompt += `## Role\n${role}\n\n`;
+    }
 
     if (identity) {
       prompt += `## Identity\n${identity}\n\n`;
     }
 
-    if (style) {
-      prompt += `## Communication Style\n${style}\n\n`;
+    if (communicationStyle) {
+      prompt += `## Communication Style\n${communicationStyle}\n\n`;
     }
 
     if (principles) {
       prompt += `## Principles\n`;
       if (typeof principles === 'string') {
-        // Handle multi-line string principles
         prompt += principles + '\n\n';
       } else if (Array.isArray(principles)) {
-        // Handle array principles
         for (const principle of principles) {
           prompt += `- ${principle}\n`;
         }
@@ -282,11 +317,9 @@ class KiroCliSetup extends BaseIdeSetup {
       }
     }
 
-    // Add menu items if available
-    if (agent.menu && agent.menu.length > 0) {
+    if (menuItems && menuItems.length > 0) {
       prompt += `## Available Workflows\n`;
-      for (let i = 0; i < agent.menu.length; i++) {
-        const item = agent.menu[i];
+      for (const [i, item] of menuItems.entries()) {
         prompt += `${i + 1}. **${item.trigger}**: ${item.description}\n`;
       }
       prompt += '\n';

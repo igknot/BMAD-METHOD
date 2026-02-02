@@ -115,11 +115,27 @@ platforms:
     # No installer config - uses custom kilo.js (creates .kilocodemodes file)
 
   kiro-cli:
-    name: "Kiro CLI"
+    name: "Kiro"
     preferred: false
     category: cli
-    description: "Kiro command-line interface"
-    # No installer config - uses custom kiro-cli.js (YAML→JSON conversion)
+    description: "Kiro AI development environment with agents and commands"
+    # Custom installer - uses kiro-cli.js with schema validation
+    installer:
+      target_dir: .kiro
+      subdirs:
+        agents: agents
+        commands: commands
+      file_patterns:
+        agent_config: "bmad-{name}.json"
+        agent_prompt: "bmad-{name}-prompt.md"
+        command: "bmad-{workflow}.md"
+      validation:
+        agent_schema: "kiro-agent-schema.json"
+      artifact_types:
+        - agents
+        - workflows
+        - tasks
+        - tools
 
   opencode:
     name: "OpenCode"
