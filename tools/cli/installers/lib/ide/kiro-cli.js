@@ -240,7 +240,7 @@ class KiroCliSetup extends BaseIdeSetup {
    */
   async generateSteeringFiles(projectDir) {
     try {
-      this.steeringGenerator.config.projectDir = projectDir;
+      this.steeringGenerator.projectDir = projectDir;
       const results = await this.steeringGenerator.generateAll();
 
       if (results.errors.length > 0) {
