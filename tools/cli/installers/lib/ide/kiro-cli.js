@@ -5,6 +5,7 @@ const fs = require('fs-extra');
 const { AgentCommandGenerator } = require('./shared/agent-command-generator');
 const { WorkflowCommandGenerator } = require('./shared/workflow-command-generator');
 const { TaskToolCommandGenerator } = require('./shared/task-tool-command-generator');
+const { KiroSteeringGenerator } = require('./shared/kiro-steering-generator');
 const Ajv = require('ajv');
 
 // Load and compile schema once
@@ -44,6 +45,7 @@ class KiroCliSetup extends BaseIdeSetup {
     this.agentGenerator = new AgentCommandGenerator(this.bmadFolderName);
     this.workflowGenerator = new WorkflowCommandGenerator(this.bmadFolderName);
     this.taskToolGenerator = new TaskToolCommandGenerator();
+    this.steeringGenerator = new KiroSteeringGenerator();
   }
 
   /**
@@ -108,6 +110,7 @@ class KiroCliSetup extends BaseIdeSetup {
   async cleanup(projectDir) {
     const bmadAgentsDir = path.join(projectDir, this.configDir, this.agentsDir);
     const bmadCommandsDir = path.join(projectDir, this.configDir, 'commands');
+    const steeringDir = path.join(projectDir, this.configDir, 'steering');
 
     let totalRemoved = 0;
 
@@ -145,6 +148,16 @@ class KiroCliSetup extends BaseIdeSetup {
 
       totalRemoved += removedCount;
       console.log(chalk.dim(`  Cleaned ${removedCount} BMAD command files from ${this.name}`));
+    }
+
+    // Clean steering files
+    if (await fs.pathExists(steeringDir)) {
+      try {
+        await fs.remove(steeringDir);
+        console.log(chalk.dim(`  Cleaned steering directory from ${this.name}`));
+      } catch (error) {
+        console.warn(chalk.yellow(`  Warning: Failed to remove steering directory: ${error.message}`));
+      }
     }
 
     console.log(chalk.dim(`  Total files removed: ${totalRemoved}`));
@@ -207,8 +220,11 @@ class KiroCliSetup extends BaseIdeSetup {
       // Generate tool command files
       const toolCount = await this.generateToolCommands(bmadDir, commandsDir);
 
+      // Generate steering files from BMAD artifacts
+      const steeringResults = await this.generateSteeringFiles(projectDir);
+
       // Display installation summary
-      this.displayInstallationSummary(agentCount, workflowCount, taskCount, toolCount, skippedItems);
+      this.displayInstallationSummary(agentCount, workflowCount, taskCount, toolCount, steeringResults, skippedItems);
     } catch (error) {
       console.error(chalk.red('Installation failed:'), error.message);
       console.log(chalk.yellow('Cleaning up partial installation...'));
@@ -218,18 +234,44 @@ class KiroCliSetup extends BaseIdeSetup {
   }
 
   /**
+   * Generate steering files from BMAD artifacts
+   * @param {string} projectDir - Project directory
+   * @returns {Promise<Object>} Generation results
+   */
+  async generateSteeringFiles(projectDir) {
+    try {
+      this.steeringGenerator.config.projectDir = projectDir;
+      const results = await this.steeringGenerator.generateAll();
+
+      if (results.errors.length > 0) {
+        console.log(chalk.yellow(`⚠ Steering generation warnings: ${results.errors.length}`));
+        for (const error of results.errors) {
+          console.log(chalk.dim(`  ${error}`));
+        }
+      }
+
+      return results;
+    } catch (error) {
+      console.warn(chalk.yellow(`  Warning: Failed to generate steering files: ${error.message}`));
+      return { generated: 0, errors: [error.message] };
+    }
+  }
+
+  /**
    * Display installation summary with counts and skipped items
    * @param {number} agentCount - Number of agents generated
    * @param {number} workflowCount - Number of workflows generated
    * @param {number} taskCount - Number of tasks generated
    * @param {number} toolCount - Number of tools generated
+   * @param {Object} steeringResults - Steering generation results
    * @param {Array} skippedItems - Array of skipped items with reasons
    */
-  displayInstallationSummary(agentCount, workflowCount, taskCount, toolCount, skippedItems) {
+  displayInstallationSummary(agentCount, workflowCount, taskCount, toolCount, steeringResults, skippedItems) {
     console.log(chalk.green(`✓ Generated agents: ${agentCount} files`));
     console.log(chalk.green(`✓ Generated workflows: ${workflowCount} files`));
     console.log(chalk.green(`✓ Generated tasks: ${taskCount} files`));
     console.log(chalk.green(`✓ Generated tools: ${toolCount} files`));
+    console.log(chalk.green(`✓ Generated steering files: ${steeringResults.generated} files`));
 
     if (skippedItems.length > 0) {
       const skippedAgents = skippedItems.filter((item) => item.type === 'agent').length;
