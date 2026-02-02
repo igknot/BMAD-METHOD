@@ -9,6 +9,26 @@ const { toColonName, toColonPath, toDashPath } = require('./path-utils');
  */
 class TaskToolCommandGenerator {
   /**
+   * Collect tools from tool manifest for command generation
+   * @param {string} bmadDir - BMAD installation directory
+   * @returns {Promise<Array>} Array of tool objects
+   */
+  async collectTools(bmadDir) {
+    const tools = await this.loadToolManifest(bmadDir);
+    return tools ? tools.filter((t) => t.standalone === 'true' || t.standalone === true) : [];
+  }
+
+  /**
+   * Collect tasks from task manifest for command generation
+   * @param {string} bmadDir - BMAD installation directory
+   * @returns {Promise<Array>} Array of task objects
+   */
+  async collectTasks(bmadDir) {
+    const tasks = await this.loadTaskManifest(bmadDir);
+    return tasks ? tasks.filter((t) => t.standalone === 'true' || t.standalone === true) : [];
+  }
+
+  /**
    * Generate task and tool commands from manifest CSVs
    * @param {string} projectDir - Project directory
    * @param {string} bmadDir - BMAD installation directory

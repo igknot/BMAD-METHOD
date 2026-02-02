@@ -53,7 +53,8 @@ class KiroCliSetup extends BaseIdeSetup {
    */
   validateAgentJson(agentConfig) {
     if (!validate(agentConfig)) {
-      throw new Error(`Invalid agent schema: ${JSON.stringify(validate.errors)}`);
+      const errorDetails = validate.errors.map((err) => `${err.instancePath}: ${err.message}`).join(', ');
+      throw new Error(`Invalid agent schema: ${errorDetails}`);
     }
   }
 
@@ -87,10 +88,10 @@ class KiroCliSetup extends BaseIdeSetup {
     if (kiroExists) {
       console.log(chalk.green(`✓ Found existing ${this.configDir}/ installation`));
       if (agentsExists) {
-        console.log(chalk.dim(`  └─ ${this.configDir}/${this.agentsDir}/ exists`));
+        console.log(chalk.dim(`  └─ ${path.join(this.configDir, this.agentsDir)}/ exists`));
       }
       if (commandsExists) {
-        console.log(chalk.dim(`  └─ ${this.configDir}/commands/ exists`));
+        console.log(chalk.dim(`  └─ ${path.join(this.configDir, 'commands')}/ exists`));
       }
       console.log(chalk.cyan('→ Upgrade mode: Will clean and reinstall'));
       return { state: 'upgrade', canProceed: true };
@@ -106,21 +107,51 @@ class KiroCliSetup extends BaseIdeSetup {
    */
   async cleanup(projectDir) {
     const bmadAgentsDir = path.join(projectDir, this.configDir, this.agentsDir);
+    const bmadCommandsDir = path.join(projectDir, this.configDir, 'commands');
+
+    let totalRemoved = 0;
 
     if (await fs.pathExists(bmadAgentsDir)) {
-      // Remove existing BMad agents
       const files = await fs.readdir(bmadAgentsDir);
-      for (const file of files) {
-        if (file.startsWith('bmad')) {
+      const bmadFiles = files.filter((f) => f.startsWith('bmad'));
+      let removedCount = 0;
+
+      for (const file of bmadFiles) {
+        try {
           await fs.remove(path.join(bmadAgentsDir, file));
+          removedCount++;
+        } catch (error) {
+          console.warn(chalk.yellow(`  Warning: Failed to remove ${file}: ${error.message}`));
         }
       }
-      console.log(chalk.dim(`  Cleaned old BMAD agents from ${this.name}`));
+
+      totalRemoved += removedCount;
+      console.log(chalk.dim(`  Cleaned ${removedCount} BMAD agent files from ${this.name}`));
     }
+
+    if (await fs.pathExists(bmadCommandsDir)) {
+      const files = await fs.readdir(bmadCommandsDir);
+      const bmadFiles = files.filter((f) => f.startsWith('bmad'));
+      let removedCount = 0;
+
+      for (const file of bmadFiles) {
+        try {
+          await fs.remove(path.join(bmadCommandsDir, file));
+          removedCount++;
+        } catch (error) {
+          console.warn(chalk.yellow(`  Warning: Failed to remove ${file}: ${error.message}`));
+        }
+      }
+
+      totalRemoved += removedCount;
+      console.log(chalk.dim(`  Cleaned ${removedCount} BMAD command files from ${this.name}`));
+    }
+
+    console.log(chalk.dim(`  Total files removed: ${totalRemoved}`));
   }
 
   /**
-   * Setup Kiro CLI configuration with BMad agents
+   * Setup Kiro CLI configuration with BMad agents and workflows
    * Uses shared AgentCommandGenerator to collect artifacts from installed bmadDir,
    * then transforms them to Kiro-specific JSON format.
    *
@@ -131,39 +162,81 @@ class KiroCliSetup extends BaseIdeSetup {
   async setup(projectDir, bmadDir, options = {}) {
     console.log(chalk.cyan(`Setting up ${this.name}...`));
 
-    // Detect existing installation state
-    const detection = await this.detectInstallation(projectDir);
-    if (!detection.canProceed) {
-      console.log(chalk.red(`Cannot proceed: ${this.bmadFolderName}/ folder is required.`));
-      console.log(chalk.yellow('Please install BMAD first before running Kiro setup.'));
-      return;
+    try {
+      // Detect existing installation state
+      const detection = await this.detectInstallation(projectDir);
+      if (!detection.canProceed) {
+        throw new Error(`Cannot proceed: ${this.bmadFolderName}/ folder is required. Please install BMAD first.`);
+      }
+
+      await this.cleanup(projectDir);
+
+      const kiroDir = path.join(projectDir, this.configDir);
+      const agentsDir = path.join(kiroDir, this.agentsDir);
+      const commandsDir = path.join(kiroDir, 'commands');
+
+      await this.ensureDir(agentsDir);
+      await this.ensureDir(commandsDir);
+
+      // Discover all available modules from the installed bmadDir
+      const allModules = await this.discoverAllModules(bmadDir);
+      console.log(chalk.dim(`  Discovered modules: ${allModules.join(', ')}`));
+
+      // Use shared generator to collect agent artifacts from all discovered modules
+      const { artifacts: agentArtifacts } = await this.agentGenerator.collectAgentArtifacts(bmadDir, allModules);
+
+      // Track skipped items
+      const skippedItems = [];
+      let agentCount = 0;
+      for (const artifact of agentArtifacts) {
+        try {
+          await this.processAgentArtifact(artifact, agentsDir, projectDir);
+          agentCount++;
+        } catch (error) {
+          console.warn(chalk.yellow(`  Warning: Failed to process agent ${artifact.name}: ${error.message}`));
+          skippedItems.push({ type: 'agent', name: artifact.name, reason: error.message });
+        }
+      }
+
+      // Generate workflow command files
+      const workflowCount = await this.generateWorkflowCommands(bmadDir, commandsDir);
+
+      // Generate task command files
+      const taskCount = await this.generateTaskCommands(bmadDir, commandsDir);
+
+      // Generate tool command files
+      const toolCount = await this.generateToolCommands(bmadDir, commandsDir);
+
+      // Display installation summary
+      this.displayInstallationSummary(agentCount, workflowCount, taskCount, toolCount, skippedItems);
+    } catch (error) {
+      console.error(chalk.red('Installation failed:'), error.message);
+      console.log(chalk.yellow('Cleaning up partial installation...'));
+      await this.cleanup(projectDir);
+      throw error;
     }
+  }
 
-    await this.cleanup(projectDir);
+  /**
+   * Display installation summary with counts and skipped items
+   * @param {number} agentCount - Number of agents generated
+   * @param {number} workflowCount - Number of workflows generated
+   * @param {number} taskCount - Number of tasks generated
+   * @param {number} toolCount - Number of tools generated
+   * @param {Array} skippedItems - Array of skipped items with reasons
+   */
+  displayInstallationSummary(agentCount, workflowCount, taskCount, toolCount, skippedItems) {
+    console.log(chalk.green(`✓ Generated agents: ${agentCount} files`));
+    console.log(chalk.green(`✓ Generated workflows: ${workflowCount} files`));
+    console.log(chalk.green(`✓ Generated tasks: ${taskCount} files`));
+    console.log(chalk.green(`✓ Generated tools: ${toolCount} files`));
 
-    const kiroDir = path.join(projectDir, this.configDir);
-    const agentsDir = path.join(kiroDir, this.agentsDir);
-
-    await this.ensureDir(agentsDir);
-
-    // Discover all available modules from the installed bmadDir
-    const allModules = await this.discoverAllModules(bmadDir);
-    console.log(chalk.dim(`  Discovered modules: ${allModules.join(', ')}`));
-
-    // Use shared generator to collect agent artifacts from all discovered modules
-    const { artifacts: agentArtifacts } = await this.agentGenerator.collectAgentArtifacts(bmadDir, allModules);
-
-    let agentCount = 0;
-    for (const artifact of agentArtifacts) {
-      try {
-        await this.processAgentArtifact(artifact, agentsDir, projectDir);
-        agentCount++;
-      } catch (error) {
-        console.warn(chalk.yellow(`  Warning: Failed to process agent ${artifact.name}: ${error.message}`));
+    if (skippedItems.length > 0) {
+      const skippedAgents = skippedItems.filter((item) => item.type === 'agent').length;
+      if (skippedAgents > 0) {
+        console.log(chalk.yellow(`⚠ Skipped: ${skippedAgents} invalid agents (see warnings above)`));
       }
     }
-
-    console.log(chalk.green(`✓ ${this.name} configured with ${agentCount} BMad agents from ${allModules.length} modules`));
   }
 
   /**
@@ -334,7 +407,7 @@ class KiroCliSetup extends BaseIdeSetup {
     const agentConfig = {
       name: agentName,
       description: `${agentData.name} - ${agentData.role || agentData.title}`,
-      prompt: `file://./${agentName}-prompt.md`,
+      prompt: `file://${path.posix.join('.', `${agentName}-prompt.md`)}`,
       tools: ['*'],
       mcpServers: {},
       useLegacyMcpJson: true,
@@ -392,6 +465,138 @@ class KiroCliSetup extends BaseIdeSetup {
     prompt += `## Instructions\nYou are ${name}, part of the BMad Method. Follow your role and principles while assisting users with their development needs.\n`;
 
     return prompt;
+  }
+
+  /**
+   * Generate workflow command files for Kiro
+   * @param {string} bmadDir - BMAD installation directory
+   * @param {string} commandsDir - Commands output directory
+   * @returns {Promise<number>} Number of workflow commands generated
+   */
+  async generateWorkflowCommands(bmadDir, commandsDir) {
+    // Use shared workflow generator to collect workflow artifacts
+    const { artifacts } = await this.workflowGenerator.collectWorkflowArtifacts(bmadDir);
+
+    let workflowCount = 0;
+
+    for (const artifact of artifacts) {
+      if (artifact.type === 'workflow-command') {
+        // Generate Kiro-specific command file name: bmad-{workflow-slug}.md
+        const commandFileName = `bmad-${artifact.name}.md`;
+        const commandPath = path.join(commandsDir, commandFileName);
+
+        // Generate Kiro-specific command content
+        const commandContent = this.generateWorkflowCommandContent(artifact);
+
+        await fs.writeFile(commandPath, commandContent);
+        workflowCount++;
+      }
+    }
+
+    return workflowCount;
+  }
+
+  /**
+   * Generate Kiro-specific workflow command content
+   * @param {Object} artifact - Workflow artifact from WorkflowCommandGenerator
+   * @returns {string} Generated command content
+   */
+  generateWorkflowCommandContent(artifact) {
+    const { name, description, workflowPath } = artifact;
+
+    // workflowPath is already transformed to _bmad/ format by WorkflowCommandGenerator
+    return `# ${name}
+
+${description}
+
+LOAD @${workflowPath}
+`;
+  }
+
+  /**
+   * Generate task command files for Kiro
+   * @param {string} bmadDir - BMAD installation directory
+   * @param {string} commandsDir - Commands output directory
+   * @returns {Promise<number>} Number of task commands generated
+   */
+  async generateTaskCommands(bmadDir, commandsDir) {
+    // Use taskToolGenerator to collect tasks from manifest
+    const tasks = await this.taskToolGenerator.collectTasks(bmadDir);
+
+    let taskCount = 0;
+
+    for (const task of tasks) {
+      // Generate Kiro-specific command file name: bmad-{task-slug}.md
+      const commandFileName = `bmad-${task.name}.md`;
+      const commandPath = path.join(commandsDir, commandFileName);
+
+      // Generate Kiro-specific command content
+      const commandContent = this.generateTaskCommandContent(task);
+
+      await fs.writeFile(commandPath, commandContent);
+      taskCount++;
+    }
+
+    return taskCount;
+  }
+
+  /**
+   * Generate Kiro-specific task command content
+   * @param {Object} task - Task from task manifest
+   * @returns {string} Generated command content
+   */
+  generateTaskCommandContent(task) {
+    const { name, displayName, description, path: taskPath } = task;
+
+    return `# ${displayName || name}
+
+${description}
+
+LOAD @${taskPath}
+`;
+  }
+
+  /**
+   * Generate tool command files for Kiro
+   * @param {string} bmadDir - BMAD installation directory
+   * @param {string} commandsDir - Commands output directory
+   * @returns {Promise<number>} Number of tool commands generated
+   */
+  async generateToolCommands(bmadDir, commandsDir) {
+    // Use shared task tool generator to collect tool artifacts
+    const tools = await this.taskToolGenerator.collectTools(bmadDir);
+
+    let toolCount = 0;
+
+    for (const tool of tools) {
+      // Generate Kiro-specific command file name: bmad-{tool-slug}.md
+      const commandFileName = `bmad-${tool.name}.md`;
+      const commandPath = path.join(commandsDir, commandFileName);
+
+      // Generate Kiro-specific command content
+      const commandContent = this.generateToolCommandContent(tool);
+
+      await fs.writeFile(commandPath, commandContent);
+      toolCount++;
+    }
+
+    return toolCount;
+  }
+
+  /**
+   * Generate Kiro-specific tool command content
+   * @param {Object} tool - Tool object from tool manifest
+   * @returns {string} Generated command content
+   */
+  generateToolCommandContent(tool) {
+    const { name, description, path: toolPath } = tool;
+
+    return `# ${name}
+
+${description}
+
+LOAD @${toolPath}
+`;
   }
 
   /**

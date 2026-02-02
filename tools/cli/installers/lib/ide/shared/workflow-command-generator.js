@@ -67,24 +67,8 @@ class WorkflowCommandGenerator {
 
     for (const workflow of allWorkflows) {
       const commandContent = await this.generateCommandContent(workflow, bmadDir);
-      // Calculate the relative workflow path (e.g., bmm/workflows/4-implementation/sprint-planning/workflow.yaml)
-      let workflowRelPath = workflow.path || '';
-      // Normalize path separators for cross-platform compatibility
-      workflowRelPath = workflowRelPath.replaceAll('\\', '/');
-      // Remove _bmad/ prefix if present to get relative path from project root
-      // Handle both absolute paths (/path/to/_bmad/...) and relative paths (_bmad/...)
-      if (workflowRelPath.includes('_bmad/')) {
-        const parts = workflowRelPath.split(/_bmad\//);
-        if (parts.length > 1) {
-          workflowRelPath = parts.slice(1).join('/');
-        }
-      } else if (workflowRelPath.includes('/src/')) {
-        // Normalize source paths (e.g. .../src/bmm/...) to relative module path (e.g. bmm/...)
-        const match = workflowRelPath.match(/\/src\/([^/]+)\/(.+)/);
-        if (match) {
-          workflowRelPath = `${match[1]}/${match[2]}`;
-        }
-      }
+      // Transform workflow path to correct _bmad/ format for Kiro
+      const workflowRelPath = this.transformWorkflowPath(workflow.path);
       // Determine if this is a YAML workflow (use normalized path which is guaranteed to be a string)
       const isYamlWorkflow = workflowRelPath.endsWith('.yaml') || workflowRelPath.endsWith('.yml');
       artifacts.push({
@@ -237,16 +221,16 @@ When running any workflow:
     if (workflowPath.includes('/src/bmm/')) {
       const match = workflowPath.match(/\/src\/bmm\/(.+)/);
       if (match) {
-        transformed = `{project-root}/${this.bmadFolderName}/bmm/${match[1]}`;
-      } else if (workflowPath.includes('/src/core/')) {
-        const match = workflowPath.match(/\/src\/core\/(.+)/);
-        if (match) {
-          transformed = `{project-root}/${this.bmadFolderName}/core/${match[1]}`;
-        }
+        transformed = `_bmad/bmm/${match[1]}`;
       }
-
-      return transformed;
+    } else if (workflowPath.includes('/src/core/')) {
+      const match = workflowPath.match(/\/src\/core\/(.+)/);
+      if (match) {
+        transformed = `_bmad/core/${match[1]}`;
+      }
     }
+
+    return transformed;
   }
 
   async loadWorkflowManifest(bmadDir) {
