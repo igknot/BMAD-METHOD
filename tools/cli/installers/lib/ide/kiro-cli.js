@@ -9,7 +9,7 @@ const { KiroSteeringGenerator } = require('./shared/kiro-steering-generator');
 const Ajv = require('ajv');
 
 // Load and compile schema once
-const schemaRaw = require(path.join(__dirname, '../../../../..', 'kiro-agent-schema.json'));
+const schemaRaw = require(path.join(__dirname, 'shared', 'kiro-agent-schema.json'));
 // Remove $schema field to avoid meta-schema validation issues
 const schema = { ...schemaRaw };
 delete schema.$schema;
