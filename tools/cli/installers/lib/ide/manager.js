@@ -73,6 +73,10 @@ class IdeManager {
         if (HandlerClass) {
           const instance = new HandlerClass();
           if (instance.name && typeof instance.name === 'string') {
+            // Set bmadFolderName on custom handlers (same as config-driven handlers)
+            if (typeof instance.setBmadFolderName === 'function') {
+              instance.setBmadFolderName(this.bmadFolderName);
+            }
             this.handlers.set(instance.name, instance);
           }
         }

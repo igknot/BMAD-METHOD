@@ -5,6 +5,18 @@ const fs = require('fs-extra');
 const { AgentCommandGenerator } = require('./shared/agent-command-generator');
 const { WorkflowCommandGenerator } = require('./shared/workflow-command-generator');
 const { TaskToolCommandGenerator } = require('./shared/task-tool-command-generator');
+const Ajv = require('ajv');
+
+// Load and compile schema once
+const schemaRaw = require(path.join(__dirname, '../../../../..', 'kiro-agent-schema.json'));
+// Remove $schema field to avoid meta-schema validation issues
+const schema = { ...schemaRaw };
+delete schema.$schema;
+const ajv = new Ajv({
+  strict: false,
+  logger: false, // Suppress format warnings
+});
+const validate = ajv.compile(schema);
 
 /**
  * Kiro CLI setup handler for BMad Method
@@ -32,6 +44,17 @@ class KiroCliSetup extends BaseIdeSetup {
     this.agentGenerator = new AgentCommandGenerator(this.bmadFolderName);
     this.workflowGenerator = new WorkflowCommandGenerator(this.bmadFolderName);
     this.taskToolGenerator = new TaskToolCommandGenerator();
+  }
+
+  /**
+   * Validate agent JSON configuration against schema
+   * @param {Object} agentConfig - Agent configuration to validate
+   * @throws {Error} If validation fails
+   */
+  validateAgentJson(agentConfig) {
+    if (!validate(agentConfig)) {
+      throw new Error(`Invalid agent schema: ${JSON.stringify(validate.errors)}`);
+    }
   }
 
   /**
@@ -123,9 +146,12 @@ class KiroCliSetup extends BaseIdeSetup {
 
     await this.ensureDir(agentsDir);
 
-    // Use shared generator to collect agent artifacts from installed bmadDir
-    const selectedModules = options.selectedModules || [];
-    const { artifacts: agentArtifacts } = await this.agentGenerator.collectAgentArtifacts(bmadDir, selectedModules);
+    // Discover all available modules from the installed bmadDir
+    const allModules = await this.discoverAllModules(bmadDir);
+    console.log(chalk.dim(`  Discovered modules: ${allModules.join(', ')}`));
+
+    // Use shared generator to collect agent artifacts from all discovered modules
+    const { artifacts: agentArtifacts } = await this.agentGenerator.collectAgentArtifacts(bmadDir, allModules);
 
     let agentCount = 0;
     for (const artifact of agentArtifacts) {
@@ -137,7 +163,43 @@ class KiroCliSetup extends BaseIdeSetup {
       }
     }
 
-    console.log(chalk.green(`✓ ${this.name} configured with ${agentCount} BMad agents`));
+    console.log(chalk.green(`✓ ${this.name} configured with ${agentCount} BMad agents from ${allModules.length} modules`));
+  }
+
+  /**
+   * Discover all available modules in the bmadDir
+   * Looks for directories that contain agents/ subdirectories
+   * @param {string} bmadDir - BMAD installation directory
+   * @returns {Promise<string[]>} Array of module names
+   */
+  async discoverAllModules(bmadDir) {
+    const modules = [];
+
+    try {
+      // Always include core if it exists
+      const coreAgentsPath = path.join(bmadDir, 'core', 'agents');
+      if (await fs.pathExists(coreAgentsPath)) {
+        modules.push('core');
+      }
+
+      // Scan for other modules by looking for directories with agents/ subdirectories
+      const entries = await fs.readdir(bmadDir, { withFileTypes: true });
+
+      for (const entry of entries) {
+        if (!entry.isDirectory() || entry.name === 'core' || entry.name.startsWith('_')) {
+          continue; // Skip non-directories, core (already added), and internal directories
+        }
+
+        const moduleAgentsPath = path.join(bmadDir, entry.name, 'agents');
+        if (await fs.pathExists(moduleAgentsPath)) {
+          modules.push(entry.name);
+        }
+      }
+    } catch (error) {
+      console.warn(chalk.yellow(`  Warning: Failed to discover modules: ${error.message}`));
+    }
+
+    return modules;
   }
 
   /**
@@ -163,11 +225,24 @@ class KiroCliSetup extends BaseIdeSetup {
     const agentName = `bmad-${artifact.module}-${artifact.name}`;
     const sanitizedAgentName = this.sanitizeAgentName(agentName);
 
-    // Create Kiro JSON definition
-    await this.createAgentDefinition(agentsDir, sanitizedAgentName, agentData);
+    // Atomic generation: both files or neither
+    const jsonPath = path.join(agentsDir, `${sanitizedAgentName}.json`);
+    const promptPath = path.join(agentsDir, `${sanitizedAgentName}-prompt.md`);
 
-    // Create Kiro prompt file
-    await this.createAgentPrompt(agentsDir, sanitizedAgentName, agentData, projectDir);
+    try {
+      // Generate content first
+      const agentConfig = this.createAgentConfig(sanitizedAgentName, agentData);
+      const promptContent = this.generatePrompt(agentData);
+
+      // Write both files atomically
+      await fs.writeFile(promptPath, promptContent);
+      await fs.writeJson(jsonPath, agentConfig, { spaces: 2 });
+    } catch (error) {
+      // Cleanup on failure - ensure both files are removed
+      await fs.remove(promptPath).catch(() => {});
+      await fs.remove(jsonPath).catch(() => {});
+      throw error;
+    }
   }
 
   /**
@@ -250,12 +325,12 @@ class KiroCliSetup extends BaseIdeSetup {
   }
 
   /**
-   * Create Kiro agent JSON definition from parsed agent data
-   * @param {string} agentsDir - Agents directory
+   * Create Kiro agent JSON configuration from parsed agent data
    * @param {string} agentName - Sanitized agent name (e.g., bmad-bmm-pm)
    * @param {Object} agentData - Parsed agent data from compiled markdown
+   * @returns {Object} Agent configuration object
    */
-  async createAgentDefinition(agentsDir, agentName, agentData) {
+  createAgentConfig(agentName, agentData) {
     const agentConfig = {
       name: agentName,
       description: `${agentData.name} - ${agentData.role || agentData.title}`,
@@ -266,21 +341,10 @@ class KiroCliSetup extends BaseIdeSetup {
       resources: [],
     };
 
-    const agentPath = path.join(agentsDir, `${agentName}.json`);
-    await fs.writeJson(agentPath, agentConfig, { spaces: 2 });
-  }
+    // Validate agent configuration before returning
+    this.validateAgentJson(agentConfig);
 
-  /**
-   * Create Kiro agent prompt file from parsed agent data
-   * @param {string} agentsDir - Agents directory
-   * @param {string} agentName - Sanitized agent name
-   * @param {Object} agentData - Parsed agent data from compiled markdown
-   * @param {string} projectDir - Project directory
-   */
-  async createAgentPrompt(agentsDir, agentName, agentData, projectDir) {
-    const promptPath = path.join(agentsDir, `${agentName}-prompt.md`);
-    const prompt = this.generatePrompt(agentData);
-    await fs.writeFile(promptPath, prompt);
+    return agentConfig;
   }
 
   /**
